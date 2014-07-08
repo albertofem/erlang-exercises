@@ -3,72 +3,135 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, stop/0, allocate/0, deallocate/1, ping/1, add_frequency/1]).
--export([init/1, terminate/2, handle_cast/2, handle_call/3]).
+-export([
+  start_link/1,
+  stop/0,
+  state/0,
+  allocate/0,
+  deallocate/0,
+  ping/0,
+  add_frequency/1
+]).
+
+-export([
+  init/1,
+  terminate/2,
+  handle_cast/2,
+  handle_call/3,
+  handle_info/2
+]).
 
 -define(SERVER, ?MODULE).
 -define(PING_INTERVAL, 1000). % 1 second
--define(PING_TIMEOUT, 5000). % 5 seconds
+-define(PING_TIMEOUT, 50000). % 5 seconds
 
-start_link() ->
-  gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+-record(frequencies, {
+  free,
+  allocated
+}).
+
+%%& FREQUENCY API %%%
+
+start_link(Frequencies) ->
+  gen_server:start_link({local, ?SERVER}, ?MODULE, Frequencies, []).
 
 stop() ->
   gen_server:cast(?MODULE, stop).
 
 allocate() ->
-  gen_server:call(?MODULE, {allocate, self()}).
+  gen_server:call(?SERVER, allocate).
 
-deallocate(Freq) ->
-  gen_server:call(?MODULE, {deallocate, Freq}).
+state() ->
+  gen_server:call(?SERVER, state).
+
+deallocate() ->
+  gen_server:call(?SERVER, deallocate).
+
+ping() ->
+  gen_server:call(?SERVER, ping).
 
 add_frequency(NewFrequency) ->
-  gen_server:cast(?MODULE, {add_frequencies, NewFrequency}).
+  gen_server:cast(?SERVER, {add_frequency, NewFrequency}).
 
-ping(Freq) ->
-  gen_server:cast(?MODULE, {ping, Freq}).
+%%% GEN SERVER CALLBACKS %%%
 
-handle_call({allocate, Pid}, _From, Frequencies) ->
+%%% SYNC CALLS %%%
+
+handle_call(allocate, {Pid, _}, Frequencies) ->
   {NewFrequencies, Reply} = allocate(Frequencies, Pid),
   {reply, Reply, NewFrequencies};
-handle_call({deallocate, Freq}, _From, Frequencies) ->
-  NewFrequencies = deallocate(Frequencies, Freq),
-  {reply, ok, NewFrequencies}.
-% handle_call({ping, Freq}, From, Frequencies) ->
-  % refresh ping data to 0
+handle_call(deallocate, {Pid, _}, Frequencies) ->
+  NewFrequencies = deallocate(Frequencies, Pid),
+  {reply, ok, NewFrequencies};
+handle_call(ping, {Pid, _}, Frequencies) ->
+  NewFrequencies = ping(Frequencies, Pid),
+  {reply, ok, NewFrequencies};
+handle_call(state, _, Frequencies) ->
+  io:write(Frequencies),
+  {reply, ok, Frequencies}.
 
 handle_cast(stop, Frequencies) ->
   {stop, normal, Frequencies};
-handle_cast({add_frequencies, NewFrequency}, {Frequencies, Allocated}) ->
-  {noreply, {Frequencies++[NewFrequency], Allocated}}.
-% handle_cast({ping, Freq}, Frequencies) ->
+handle_cast({add_frequency, NewFrequency}, #frequencies{free = Free, allocated = Allocated}) ->
+  NewFrequencies = #frequencies{
+    free = Free++[NewFrequency],
+    allocated = Allocated
+  },
+  {noreply, NewFrequencies}.
 
+handle_info(ping_refresh, #frequencies{free = Free, allocated = []}) ->
+  NewFrequencies = #frequencies{
+      free = Free,
+      allocated = []
+  },
+  {noreply, NewFrequencies};
+handle_info(ping_refresh, #frequencies{free = Free, allocated = [{Freq, Pid, Ping} | Allocated]}) when Ping < ?PING_TIMEOUT ->
+  NewFrequencies = #frequencies{
+      free = Free,
+      allocated = [{Freq, Pid, Ping+?PING_INTERVAL}] ++ Allocated
+  },
+  {noreply, NewFrequencies};
+handle_info(ping_refresh, #frequencies{free = Free, allocated = [{Freq, _, Ping} | Allocated]}) when Ping >= ?PING_TIMEOUT ->
+  NewFrequencies = #frequencies{
+      free = Free ++ [Freq],
+      allocated = Allocated
+  },
+  {noreply, NewFrequencies}.
 
-init(_Args) ->
-  %erlang:send_after(?PING_INTERVAL, self(), ping_refresh),
-  %erlang:send_after(?PING_TIMEOUT, self(), ping_check),
-  {ok, {get_frequencies(), []}}.
+init(Frequencies) ->
+  timer:send_interval(?PING_INTERVAL, ping_refresh),
+  NewFrequencies = #frequencies{
+    free = Frequencies,
+    allocated = []
+  },
+  {ok, NewFrequencies}.
 
 terminate(_Reason, _Frequencies) ->
   ok.
 
-get_frequencies() -> [10, 11, 12, 13, 14, 15].
+allocate(#frequencies{free = [], allocated = Allocated}, _Pid) ->
+  NewFrequencies = #frequencies{
+      free = [],
+      allocated = Allocated
+  },
+  {NewFrequencies, {error, no_frequencies}};
+allocate(#frequencies{free = [Freq | Free], allocated = Allocated}, Pid) ->
+  NewFrequencies = #frequencies{
+      free = Free,
+      allocated = Allocated++[{Freq, Pid, 0}]
+  },
+  {NewFrequencies, {ok, Freq}}.
 
-allocate({[], Allocated}, _Pid) ->
-  {{[], Allocated}, {error, no_frequencies}};
-allocate({[Freq|Frequencies], Allocated}, Pid) ->
-  {{Frequencies,[{Freq,Pid}|Allocated]}, {ok, Freq}}.
+deallocate(#frequencies{free = Free, allocated = [{Freq, Pid, _} | Allocated]}, Pid) ->
+  NewFrequencies = #frequencies{
+      free = Free ++ [Freq],
+      allocated = Allocated
+  },
+  NewFrequencies.
 
-deallocate({Free, Allocated}, Freq) ->
-  {value, {Freq, _Pid}} = lists:keysearch(Freq, 1, Allocated),
-  NewAllocated = lists:keydelete(Freq, 1, Allocated),
-  {[Freq|Free], NewAllocated}.
-
-%% handle_info(ping_refresh, _Frequencies) ->
-%%   io:write("Received info to refresh pings"),
-%%   erlang:send_after(?PING_INTERVAL, self(), ping_refresh),
-%%   {noreply, ok};
-%% handle_info(ping_check, _Frequencies) ->
-%%   io:write("Received info to check pings"),
-%%   erlang:send_after(?PING_TIMEOUT, self(), ping_check),
-%%   {noreply, ok}.
+ping(#frequencies{free = Free, allocated = [{Freq, Pid, _} | Allocated]}, Pid) ->
+  NewFrequencies = #frequencies{
+      free = Free,
+      allocated = [{Freq, Pid, 0}]++Allocated
+  },
+  NewFrequencies.
